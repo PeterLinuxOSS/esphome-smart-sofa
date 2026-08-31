@@ -34,6 +34,29 @@ described in [`calibration.md`](calibration.md)
 (`name_endstop_thr`, `name_startup_grace`, `name_max_runtime`,
 `name_endstop_debounce`).
 
+## Device info
+
+Without a `project:` block a board shows up as a bare **esp32 by Espressif**.
+The package sets one, and Home Assistant renders it like this:
+
+| Field | Comes from | Example |
+|---|---|---|
+| Manufacturer | `project_name`, before the dot | `PeterLinuxOSS` |
+| Model | `project_name`, after the dot | `Smart Sofa` |
+| Firmware | `project_version` + ESPHome version | `2.1.0 (ESPHome 2026.9.0-dev)` |
+
+`project_name` must contain **exactly one dot** — ESPHome rejects the config
+otherwise. Both are substitutions, so a fork can put its own name there:
+
+```yaml
+substitutions:
+  project_name:    "YourName.Sofa Controller"
+  project_version: "1.0.0"
+```
+
+This is metadata only. It never touches `unique_id`, so unlike the entity names
+it is safe to change on a running installation.
+
 ## Position semantics
 
 Home Assistant's convention is `1.0 = open`, `0.0 = closed`, and calibration

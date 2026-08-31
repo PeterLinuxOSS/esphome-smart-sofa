@@ -52,7 +52,7 @@ substitutions:
   pin_btn_close: "GPIO26"
 
 packages:
-  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v2.0.0
+  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v2.1.0
 
 api:
   encryption:
@@ -94,6 +94,8 @@ cannot resolve `!secret` from inside a remote package.
 | `max_current` | `4.0` | INA226 full-scale current, in A |
 | `extend_time_ms` | `9000` | Seed full-extend time (calibration overwrites it) |
 | `retract_time_ms` | `10000` | Seed full-retract time (calibration overwrites it) |
+| `project_name` | `PeterLinuxOSS.Smart Sofa` | Device info in HA; split on the dot into manufacturer and model |
+| `project_version` | package version | Shown as `x (ESPHome y)` |
 
 The two travel times are only used on a **first** boot. They are stored in flash
 with `restore_value`, so once calibration has run the substitutions no longer

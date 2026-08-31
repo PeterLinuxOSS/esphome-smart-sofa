@@ -34,6 +34,12 @@ substitutions:
   extend_time_ms:  "9000"    # full extend  (open, position 0 -> 1)
   retract_time_ms: "10000"   # full retract (close, position 1 -> 0)
 
+  # Shown in Home Assistant's device info. HA splits the name on the dot into
+  # manufacturer and model, and renders the version as "x (ESPHome y)" — without
+  # this a board just says "esp32 by Espressif".
+  project_name:    "PeterLinuxOSS.Smart Sofa"
+  project_version: "2.1.0"
+
   # Entity names. Overridable so the dashboard can be in any language without
   # forking — see docs/home-assistant.md before changing them on a live system.
   name_cover:          "Sofa"
@@ -58,6 +64,9 @@ substitutions:
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
+  project:
+    name: "${project_name}"
+    version: "${project_version}"
   on_boot:
     priority: 600
     then:
