@@ -77,14 +77,14 @@ to order a PCB.
 
 ## Choosing the current threshold
 
-The end stop is detected as "current below `Prah endstopu` for at least
-`Doba potvrdenia dorazu`". To find the right threshold, watch **Prúd aktuátora**
+The end stop is detected as "current below `Endstop threshold` for at least
+`Endstop confirmation time`". To find the right threshold, watch **Actuator current**
 in Home Assistant during a full travel:
 
 - Running under load, expect a steady draw well above the threshold.
 - At the mechanical limit the value collapses toward zero.
 
 Set the threshold roughly halfway between the two, and leave
-`Rozbehová predĺžka` long enough to cover the inrush and the initial slack —
+`Startup grace period` long enough to cover the inrush and the initial slack —
 during that window the threshold is ignored, otherwise every start would look
 like an end stop.

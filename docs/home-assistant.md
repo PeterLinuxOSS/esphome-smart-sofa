@@ -2,42 +2,47 @@
 
 ## Entities
 
-Names below are the Slovak defaults; Home Assistant prefixes them with
-`friendly_name`.
+Every name below is a substitution, so the dashboard can be in any language
+without forking — see [Renaming](#renaming) before changing one. Home Assistant
+prefixes them all with `friendly_name`.
 
 ### Control
 
-| Entity | Domain | Notes |
-|---|---|---|
-| `Gauč` | `cover` | `device_class: awning`, full 0–100 % position support |
-| `Zámok tlačidiel` | `switch` | ON = the physical buttons do nothing; HA still works |
-| `Kalibrovať (obe strany)` | `button` | Runs the three-phase calibration |
+| Entity | Substitution | Domain | Notes |
+|---|---|---|---|
+| `Sofa` | `name_cover` | `cover` | `device_class: awning`, full 0–100 % position support |
+| `Button lock` | `name_button_lock` | `switch` | ON = the physical buttons do nothing; HA still works |
+| `Calibrate (both ends)` | `name_calibrate` | `button` | Runs the three-phase calibration |
 
 ### State
 
-| Entity | Domain | Notes |
-|---|---|---|
-| `Pozícia` | `sensor` | 0–100 %, same value as the cover |
-| `Gauč sa hýbe` | `binary_sensor` | `device_class: moving` |
-| `Prúd aktuátora` | `sensor` | A, throttled to 1 s with a 0.01 delta |
-| `Napájacie napätie` | `sensor` | V |
-| `Príkon` | `sensor` | W |
+| Entity | Substitution | Domain | Notes |
+|---|---|---|---|
+| `Position` | `name_position` | `sensor` | 0–100 %, same value as the cover |
+| `Sofa moving` | `name_moving` | `binary_sensor` | `device_class: moving` |
+| `Actuator current` | `name_current` | `sensor` | A, throttled to 1 s with a 0.01 delta |
+| `Supply voltage` | `name_voltage` | `sensor` | V |
+| `Power` | `name_power` | `sensor` | W |
+| `Button up` / `Button down` | `name_btn_up` / `name_btn_down` | `binary_sensor` | The hand controller's two inputs |
 
 ### Diagnostic and config
 
-`Zmeraný čas vysuv` / `Zmeraný čas zasuv` (the calibration results),
-`WiFi signál`, `Uptime`, and the four tuning numbers described in
-[`calibration.md`](calibration.md).
+`Measured extend time` / `Measured retract time` (`name_extend_time`,
+`name_retract_time` — the calibration results), `WiFi signal`
+(`name_wifi_signal`), `Uptime` (`name_uptime`), and the four tuning numbers
+described in [`calibration.md`](calibration.md)
+(`name_endstop_thr`, `name_startup_grace`, `name_max_runtime`,
+`name_endstop_debounce`).
 
 ## Position semantics
 
 Home Assistant's convention is `1.0 = open`, `0.0 = closed`, and calibration
 defines the retracted end as the `0.0` reference. So in the cover:
 
-- `open_action` drives with `smer_open: false` (towards 1.0)
-- `close_action` drives with `smer_open: true` (towards 0.0)
+- `open_action` drives with `towards_zero: false` (towards 1.0)
+- `close_action` drives with `towards_zero: true` (towards 0.0)
 
-The internal `smer_open` flag names the **output relay**, not the HA direction.
+The internal `towards_zero` flag names the **output relay**, not the HA direction.
 It is the single most confusing thing in this project — check it before
 "fixing" a direction bug.
 
@@ -69,9 +74,23 @@ cover:
 
 The group forwards `set_cover_position`, so a single call moves all of them.
 
-## Note on renaming
+## Renaming
 
-Entity IDs are derived from `device_name` and the entity `name:`. Changing
-either renames every entity of that board and silently breaks any automation,
-group, dashboard card or voice alias referring to the old ID. Decide on the
-names before the first flash.
+Set the names **before the first flash**, in whatever language you want:
+
+```yaml
+substitutions:
+  name_cover:    "Canapé"
+  name_position: "Position"
+  # …
+```
+
+Changing one afterwards is not a rename. ESPHome derives each entity's
+`unique_id` from `device_name` and the entity's `name:`, so a changed name
+registers a **new** entity — the old one stays behind as an orphan, and every
+automation, group, dashboard card and voice alias still points at the dead ID.
+An explicit `id:` does not help; it is internal to ESPHome and never reaches
+Home Assistant.
+
+If you must rename on a live system, expect to fix up the references by hand,
+or rename the entity in Home Assistant's UI instead and leave the YAML alone.

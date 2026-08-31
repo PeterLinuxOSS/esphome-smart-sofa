@@ -14,11 +14,11 @@ substitutions:
   pin_btn_close: "GPIO26"
 
   # Seed values only; the calibration button measures and stores the real ones.
-  cas_vysuv_ms:  "9000"
-  cas_zasuv_ms:  "10000"
+  extend_time_ms:  "9000"
+  retract_time_ms:  "10000"
 
 packages:
-  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v1.0.0
+  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v2.0.0
 
 api:
   encryption:

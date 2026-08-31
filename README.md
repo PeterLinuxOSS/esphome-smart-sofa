@@ -50,7 +50,7 @@ substitutions:
   pin_btn_close: "GPIO26"
 
 packages:
-  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v1.0.0
+  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v2.0.0
 
 api:
   encryption:
@@ -90,19 +90,27 @@ cannot resolve `!secret` from inside a remote package.
 | `ina_address` | `0x40` | INA226 address |
 | `shunt_ohm` | `0.02` | Shunt resistor value |
 | `max_current` | `4.0` | INA226 full-scale current, in A |
-| `cas_vysuv_ms` | `9000` | Seed full-extend time (calibration overwrites it) |
-| `cas_zasuv_ms` | `10000` | Seed full-retract time (calibration overwrites it) |
+| `extend_time_ms` | `9000` | Seed full-extend time (calibration overwrites it) |
+| `retract_time_ms` | `10000` | Seed full-retract time (calibration overwrites it) |
 
-The two `cas_*` values are only used on a **first** boot. They are stored in
-flash with `restore_value`, so once calibration has run the substitutions no
-longer matter.
+The two travel times are only used on a **first** boot. They are stored in flash
+with `restore_value`, so once calibration has run the substitutions no longer
+matter.
 
-## Entity names are Slovak
+Every entity name is a substitution too — `name_cover`, `name_position`,
+`name_current`, `name_calibrate` and so on, listed in
+[`docs/home-assistant.md`](docs/home-assistant.md). The defaults are English;
+override them to put the dashboard in another language without forking:
 
-The `name:` strings in the package are Slovak (`Gauč`, `Prúd aktuátora`, …)
-because that is what the author's Home Assistant runs, and changing them would
-rename entities in a live installation. If you want them in another language,
-fork and edit `packages/smart-sofa.yaml` — the logic does not depend on them.
+```yaml
+substitutions:
+  name_cover:    "Canapé"
+  name_current:  "Courant"
+```
+
+**Set them before the first flash.** ESPHome derives each entity's `unique_id`
+from the name, so changing one later registers a *new* entity rather than
+renaming the old one.
 
 ## Safety
 
