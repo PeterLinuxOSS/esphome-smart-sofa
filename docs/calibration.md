@@ -71,6 +71,22 @@ Calibration does **not** run on boot. `g_position` is restored from flash, so a
 normal reboot needs no movement. Run it by hand after installing the board, or
 after a power cut that interrupted a movement.
 
+### Upgrading across a rename
+
+ESPHome keys each `restore_value` global in NVS by a **hash of its id**, so
+renaming one silently starts a fresh slot: the stored value is still in flash
+but nothing looks for it, and the global comes up at `initial_value`. Nothing
+warns about this — the config validates and the build succeeds.
+
+That is what the v1 → v2 rename of `g_cas_vysuv_ms` → `g_extend_ms` did: every
+board came back with the seed times instead of its measured ones. **Recalibrate
+after upgrading across it.** Changing `extend_time_ms` and reflashing does not
+help — by then the new slot holds a value, so `initial_value` is ignored.
+
+The same applies to the tuning `number` entities, and it is easy to miss there:
+if a stored value happens to equal the default, the reset is invisible. Check
+the ones you deliberately tuned away from the default.
+
 ## Tuning parameters
 
 All four are `number` entities in HA, stored in flash — no reflash needed.
