@@ -1,0 +1,6 @@
+# ESPHome build output
+.esphome/
+secrets.yaml
+
+# SDD scratch
+.superpowers/

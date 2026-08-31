@@ -1,0 +1,38 @@
+# Example device config. Everything device-specific lives here; the shared
+# ~450 lines of logic come from the package.
+#
+# wifi/api/ota stay local on purpose: ESPHome cannot resolve !secret inside a
+# remote package.
+
+substitutions:
+  device_name:   smart-sofa1
+  friendly_name: Smart-Sofa1
+
+  # Per-board wiring — the two button inputs are the only pins that differ
+  # between our units (one board had IN2 rerouted off IO26).
+  pin_btn_open:  "GPIO25"
+  pin_btn_close: "GPIO26"
+
+  # Seed values only; the calibration button measures and stores the real ones.
+  cas_vysuv_ms:  "9000"
+  cas_zasuv_ms:  "10000"
+
+packages:
+  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v1.0.0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback Hotspot"
+    password: !secret ap_password
+
+captive_portal:

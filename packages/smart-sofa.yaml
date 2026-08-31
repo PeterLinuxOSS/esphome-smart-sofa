@@ -1,0 +1,586 @@
+# =============================================================================
+#  Smart Sofa — ESPHome package
+#  ESP32-WROOM-32-N4 + INA226 (shunt) + 2x AQY212GH PhotoMOS + 2x PC817C
+#
+#  Position is estimated from travel time; the end stops are detected from
+#  motor current, so no limit switches are needed. Include this package and
+#  override the substitutions below in your device file.
+#
+#  NOTE: this package must not use !secret — ESPHome cannot resolve secrets
+#  inside a remote package. Keep wifi/api/ota in the device config.
+# =============================================================================
+
+substitutions:
+  device_name:   smart-sofa
+  friendly_name: Smart Sofa
+
+  # Inputs — original hand controller, opto-isolated through PC817C
+  pin_btn_open:  "GPIO25"    # SIG1  <- U2 (PC817C), button IN1
+  pin_btn_close: "GPIO26"    # SIG2  <- U4 (PC817C), button IN2
+
+  # Outputs — PhotoMOS relays driving the actuator
+  pin_out_open:  "GPIO17"    # SOUT1 -> R10 470R -> U5 -> OUT1
+  pin_out_close: "GPIO16"    # SOUT2 -> R11 470R -> U6 -> OUT2
+
+  # I2C — INA226 current sensor
+  pin_scl:       "GPIO21"
+  pin_sda:       "GPIO22"
+  ina_address:   "0x40"
+  shunt_ohm:     "0.02"
+  max_current:   "4.0"
+
+  # Full-travel times. Only seed values — calibration overwrites them and they
+  # survive reboots (restore_value on g_cas_*). Measure once, then forget.
+  cas_vysuv_ms:  "9000"      # full extend  (open, position 0 -> 1)
+  cas_zasuv_ms:  "10000"     # full retract (close, position 1 -> 0)
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: 600
+    then:
+      # Never resume a movement across a reboot; g_position is restored instead.
+      # Calibration is manual only (button in HA), see docs/calibration.md.
+      - switch.turn_off: sw_open
+      - switch.turn_off: sw_close
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+# =============================================================================
+#  Current measurement — INA226
+# =============================================================================
+i2c:
+  sda: ${pin_sda}
+  scl: ${pin_scl}
+  scan: true
+  frequency: 400kHz
+
+sensor:
+  - platform: ina226
+    address: ${ina_address}
+    shunt_resistance: ${shunt_ohm} ohm
+    max_current: ${max_current}A
+    adc_averaging: 16
+    update_interval: 100ms      # fast, but internal — needed for endstop detection
+    current:
+      id: prud
+      internal: true            # scripts only, keeps HA and the log quiet
+      filters:
+        - median:
+            window_size: 5
+            send_every: 1
+    bus_voltage:
+      id: napatie
+      internal: true
+    power:
+      id: prikon_raw
+      internal: true
+
+  # Public sensors — throttled to 1 s and gated by a delta, so small ripple
+  # never reaches HA or the recorder.
+  - platform: template
+    name: "Prúd aktuátora"
+    unit_of_measurement: "A"
+    accuracy_decimals: 3
+    lambda: "return id(prud).state;"
+    update_interval: 1s
+    filters:
+      - delta: 0.01
+
+  - platform: template
+    name: "Napájacie napätie"
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    lambda: "return id(napatie).state;"
+    update_interval: 1s
+    filters:
+      - delta: 0.1
+
+  - platform: template
+    name: "Príkon"
+    unit_of_measurement: "W"
+    accuracy_decimals: 2
+    lambda: "return id(prud).state * id(napatie).state;"
+    update_interval: 1s
+    filters:
+      - delta: 0.1
+
+  - platform: template
+    name: "Pozícia"
+    id: pozicia_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: "return id(g_position) * 100.0;"
+    update_interval: 1s
+
+  - platform: template
+    name: "Zmeraný čas vysuv"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    lambda: "return id(g_cas_vysuv_ms);"
+    update_interval: 5s
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Zmeraný čas zasuv"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    lambda: "return id(g_cas_zasuv_ms);"
+    update_interval: 5s
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "WiFi signál"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+# =============================================================================
+#  Position state (0.0 = fully retracted, 1.0 = fully extended)
+# =============================================================================
+globals:
+  - id: g_position
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  - id: g_smer
+    type: int
+    restore_value: false
+    initial_value: "0"        # -1 towards 0.0, 0 idle, +1 towards 1.0
+
+  - id: g_move_start
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: g_trvanie_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  # Measured full-travel times — overwritten by calibration, kept across reboots
+  - id: g_cas_vysuv_ms      # travel via sw_open (smer_open:true) -> position 0.0
+    type: uint32_t
+    restore_value: true
+    initial_value: "${cas_vysuv_ms}"
+
+  - id: g_cas_zasuv_ms      # travel via sw_close (smer_open:false) -> position 1.0
+    type: uint32_t
+    restore_value: true
+    initial_value: "${cas_zasuv_ms}"
+
+  - id: g_pod_prahom_od
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"        # 0 = not currently below the endstop threshold
+
+# =============================================================================
+#  Tuning parameters — changeable from HA, no reflash needed
+# =============================================================================
+number:
+  - platform: template
+    name: "Prah endstopu"
+    id: prah_endstop
+    optimistic: true
+    restore_value: true
+    initial_value: 0.30
+    min_value: 0.02
+    max_value: 2.00
+    step: 0.01
+    unit_of_measurement: "A"
+    entity_category: config
+    mode: box
+
+  - platform: template
+    name: "Rozbehová predĺžka"
+    id: rozbeh_ms
+    optimistic: true
+    restore_value: true
+    initial_value: 800
+    min_value: 200
+    max_value: 3000
+    step: 100
+    unit_of_measurement: "ms"
+    entity_category: config
+    mode: box
+
+  - platform: template
+    name: "Max. čas chodu"
+    id: max_chod_s
+    optimistic: true
+    restore_value: true
+    initial_value: 15
+    min_value: 5
+    max_value: 60
+    step: 1
+    unit_of_measurement: "s"
+    entity_category: config
+    mode: box
+
+  - platform: template
+    name: "Doba potvrdenia dorazu"
+    id: potvrdenie_ms
+    optimistic: true
+    restore_value: true
+    initial_value: 200
+    min_value: 50
+    max_value: 1000
+    step: 50
+    unit_of_measurement: "ms"
+    entity_category: config
+    mode: box
+
+# =============================================================================
+#  PhotoMOS outputs — software interlock, never both at once
+# =============================================================================
+switch:
+  - platform: gpio
+    id: sw_open
+    pin: ${pin_out_open}
+    restore_mode: ALWAYS_OFF
+    internal: true
+    interlock: &ilk [sw_open, sw_close]
+    interlock_wait_time: 300ms
+
+  - platform: gpio
+    id: sw_close
+    pin: ${pin_out_close}
+    restore_mode: ALWAYS_OFF
+    internal: true
+    interlock: *ilk
+    interlock_wait_time: 300ms
+
+  # Physical button lock — when ON the hand controller does nothing.
+  # HA control (cover, slider, calibration) keeps working.
+  - platform: template
+    name: "Zámok tlačidiel"
+    id: zamok_tlacidiel
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    icon: mdi:lock
+    entity_category: config
+
+# =============================================================================
+#  Control scripts
+# =============================================================================
+script:
+  # Emergency/manual stop. If something was running, it EXTRAPOLATES the
+  # position from elapsed time and direction instead of leaving g_position
+  # frozen — a frozen value would block movement back in HA.
+  - id: stop_vsetko
+    mode: single
+    then:
+      - lambda: |-
+          if (id(g_smer) != 0) {
+            uint32_t ubehlo = millis() - id(g_move_start);
+            uint32_t cas_celkovy = (id(g_smer) < 0) ? id(g_cas_vysuv_ms) : id(g_cas_zasuv_ms);
+            if (cas_celkovy > 0) {
+              float zmena = ((float) ubehlo / (float) cas_celkovy) * id(g_smer);
+              id(g_position) += zmena;
+              if (id(g_position) < 0.0f) id(g_position) = 0.0f;
+              if (id(g_position) > 1.0f) id(g_position) = 1.0f;
+            }
+          }
+          id(g_smer) = 0;
+      - switch.turn_off: sw_open
+      - switch.turn_off: sw_close
+
+  # Drive to the physical endstop.
+  # g_smer convention: -1 = towards position 0.0 (via sw_open)
+  #                    +1 = towards position 1.0 (via sw_close)
+  # Must match chod_na_poziciu, otherwise the stop extrapolation counts backwards.
+  # meraj_cas: true ONLY when the whole travel is guaranteed (calibration phases
+  # that start from a known endstop). Regular open/close/button may start from
+  # any mid position and must pass false, or a partial run would overwrite the
+  # full-travel time.
+  - id: jazdi_na_doraz
+    mode: restart
+    parameters:
+      smer_open: bool
+      meraj_cas: bool
+    then:
+      - switch.turn_off: sw_open
+      - switch.turn_off: sw_close
+      - delay: 300ms
+      - lambda: |-
+          id(g_smer) = smer_open ? -1 : 1;
+          id(g_move_start) = millis();
+          id(g_pod_prahom_od) = 0;
+      - if:
+          condition:
+            lambda: "return smer_open;"
+          then:
+            - switch.turn_on: sw_open
+          else:
+            - switch.turn_on: sw_close
+      - lambda: "id(g_move_start) = millis();"
+      - delay: !lambda "return (uint32_t) id(rozbeh_ms).state;"
+      - wait_until:
+          condition:
+            lambda: |-
+              if (id(prud).state < id(prah_endstop).state) {
+                if (id(g_pod_prahom_od) == 0) id(g_pod_prahom_od) = millis();
+                return (millis() - id(g_pod_prahom_od)) >= (uint32_t) id(potvrdenie_ms).state;
+              } else {
+                id(g_pod_prahom_od) = 0;
+                return false;
+              }
+          timeout: !lambda "return (uint32_t)(id(max_chod_s).state * 1000);"
+      - switch.turn_off: sw_open
+      - switch.turn_off: sw_close
+      - lambda: |-
+          // Decide why we stopped from TIME, not from current — current drops
+          // to zero the instant the outputs go off, so reading it here races.
+          uint32_t elapsed = millis() - id(g_move_start);
+          bool dosiahnute = elapsed < (uint32_t)(id(max_chod_s).state * 1000);
+          if (dosiahnute) {
+            id(g_position) = smer_open ? 0.0f : 1.0f;
+            if (meraj_cas && elapsed > 1000 && elapsed < 30000) {
+              if (smer_open) { id(g_cas_vysuv_ms) = elapsed; }
+              else { id(g_cas_zasuv_ms) = elapsed; }
+            }
+          } else {
+            // Timeout — endstop not reached, estimate from time instead of
+            // falsely pinning the position to 0/1.
+            uint32_t cas_celkovy = smer_open ? id(g_cas_vysuv_ms) : id(g_cas_zasuv_ms);
+            if (cas_celkovy > 0) {
+              float zmena = ((float) elapsed / (float) cas_celkovy) * id(g_smer);
+              id(g_position) += zmena;
+              if (id(g_position) < 0.0f) id(g_position) = 0.0f;
+              if (id(g_position) > 1.0f) id(g_position) = 1.0f;
+            }
+          }
+          id(g_smer) = 0;
+      - logger.log:
+          format: "Doraz dosiahnutý. vysuv=%u ms  zasuv=%u ms"
+          args: ["id(g_cas_vysuv_ms)", "id(g_cas_zasuv_ms)"]
+
+  # Calibration — hits both endstops, measures both times, ends at reference 0.0.
+  # Phase 1 does NOT measure (unknown start); phases 2 and 3 do, because they
+  # follow directly on a reached endstop and are guaranteed full travels.
+  - id: kalibruj
+    mode: single
+    then:
+      - logger.log: "Kalibrácia: fáza 1/3 — na doraz cez sw_open (pozícia 0.0, bez merania)"
+      - script.execute:
+          id: jazdi_na_doraz
+          smer_open: true
+          meraj_cas: false
+      - wait_until:
+          condition:
+            lambda: "return !id(jazdi_na_doraz).is_running();"
+          timeout: !lambda "return (uint32_t)(id(max_chod_s).state * 1000) + 5000;"
+      - delay: 500ms
+
+      - logger.log: "Kalibrácia: fáza 2/3 — na doraz cez sw_close (pozícia 1.0, meriam)"
+      - script.execute:
+          id: jazdi_na_doraz
+          smer_open: false
+          meraj_cas: true
+      - wait_until:
+          condition:
+            lambda: "return !id(jazdi_na_doraz).is_running();"
+          timeout: !lambda "return (uint32_t)(id(max_chod_s).state * 1000) + 5000;"
+      - delay: 500ms
+
+      - logger.log: "Kalibrácia: fáza 3/3 — návrat do referencie (pozícia 0.0, meriam)"
+      - script.execute:
+          id: jazdi_na_doraz
+          smer_open: true
+          meraj_cas: true
+      - wait_until:
+          condition:
+            lambda: "return !id(jazdi_na_doraz).is_running();"
+          timeout: !lambda "return (uint32_t)(id(max_chod_s).state * 1000) + 5000;"
+
+      - logger.log:
+          format: "Kalibrácia hotová. vysuv=%u ms  zasuv=%u ms"
+          args: ["id(g_cas_vysuv_ms)", "id(g_cas_zasuv_ms)"]
+
+  # Move to an exact position 0.0–1.0, timed from the measured g_cas_* values.
+  # Same convention as jazdi_na_doraz: decreasing position (delta<0) = sw_open,
+  # increasing position (delta>0) = sw_close.
+  - id: chod_na_poziciu
+    mode: restart
+    parameters:
+      cielova_pozicia: float
+    then:
+      - lambda: |-
+          float delta = cielova_pozicia - id(g_position);
+          if (fabs(delta) < 0.01f) {
+            id(g_trvanie_ms) = 0;
+            return;
+          }
+          bool smer_open = (delta < 0);
+          uint32_t cas_celkovy = smer_open ? id(g_cas_vysuv_ms) : id(g_cas_zasuv_ms);
+          id(g_trvanie_ms) = (uint32_t)(fabs(delta) * cas_celkovy);
+          id(g_smer) = smer_open ? -1 : 1;
+          id(g_move_start) = millis();   // set now, so a stop during the 300 ms
+                                         // pause below does not use a stale value
+      - if:
+          condition:
+            lambda: "return id(g_trvanie_ms) > 0;"
+          then:
+            - switch.turn_off: sw_open
+            - switch.turn_off: sw_close
+            - delay: 300ms
+            - if:
+                condition:
+                  lambda: "return id(g_smer) < 0;"
+                then:
+                  - switch.turn_on: sw_open
+                else:
+                  - switch.turn_on: sw_close
+            - lambda: "id(g_move_start) = millis(); id(g_pod_prahom_od) = 0;"
+            - wait_until:
+                condition:
+                  lambda: |-
+                    uint32_t ubehlo = millis() - id(g_move_start);
+                    bool cas_uplynul = ubehlo >= id(g_trvanie_ms);
+                    bool za_rozbehom = ubehlo > (uint32_t) id(rozbeh_ms).state;
+                    bool pod_prahom = id(prud).state < id(prah_endstop).state;
+                    bool na_doraze = false;
+                    if (za_rozbehom && pod_prahom) {
+                      if (id(g_pod_prahom_od) == 0) id(g_pod_prahom_od) = millis();
+                      na_doraze = (millis() - id(g_pod_prahom_od)) >= (uint32_t) id(potvrdenie_ms).state;
+                    } else {
+                      id(g_pod_prahom_od) = 0;
+                    }
+                    return cas_uplynul || na_doraze;
+                timeout: !lambda "return id(g_trvanie_ms) + 3000;"
+            - switch.turn_off: sw_open
+            - switch.turn_off: sw_close
+            - lambda: |-
+                // Again decided from TIME: did we finish before the planned
+                // duration? Then it was an endstop. Reading current here races.
+                uint32_t ubehlo = millis() - id(g_move_start);
+                bool na_doraze = ubehlo < id(g_trvanie_ms);
+                if (na_doraze) {
+                  id(g_position) = (id(g_smer) < 0) ? 0.0f : 1.0f;
+                } else {
+                  id(g_position) = cielova_pozicia;
+                }
+                id(g_smer) = 0;
+      - logger.log: "Presun na pozíciu dokončený"
+
+# =============================================================================
+#  Original hand controller via PC817C — hold = drive to endstop, release = stop.
+#  Releasing mid-travel runs stop_vsetko, which extrapolates the position, so
+#  physical operation is tracked too (with time-estimate accuracy).
+# =============================================================================
+binary_sensor:
+  - platform: gpio
+    id: btn_open
+    name: "Tlačidlo hore"
+    pin:
+      number: ${pin_btn_open}
+      mode:
+        input: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 60ms
+    on_press:
+      - if:
+          condition:
+            switch.is_off: zamok_tlacidiel
+          then:
+            - script.execute:
+                id: jazdi_na_doraz
+                smer_open: true
+                meraj_cas: false
+    on_release:
+      - if:
+          condition:
+            switch.is_off: zamok_tlacidiel
+          then:
+            - script.stop: jazdi_na_doraz
+            - script.stop: chod_na_poziciu
+            - script.execute: stop_vsetko
+
+  - platform: gpio
+    id: btn_close
+    name: "Tlačidlo dole"
+    pin:
+      number: ${pin_btn_close}
+      mode:
+        input: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 60ms
+    on_press:
+      - if:
+          condition:
+            switch.is_off: zamok_tlacidiel
+          then:
+            - script.execute:
+                id: jazdi_na_doraz
+                smer_open: false
+                meraj_cas: false
+    on_release:
+      - if:
+          condition:
+            switch.is_off: zamok_tlacidiel
+          then:
+            - script.stop: jazdi_na_doraz
+            - script.stop: chod_na_poziciu
+            - script.execute: stop_vsetko
+
+  - platform: template
+    name: "Gauč sa hýbe"
+    id: hybe_sa
+    lambda: "return id(g_smer) != 0;"
+    device_class: moving
+
+# =============================================================================
+#  Home Assistant control — cover with a 0–100 % position slider
+# =============================================================================
+cover:
+  - platform: template
+    name: "Gauč"
+    id: gauc
+    device_class: awning
+    lambda: "return id(g_position);"
+    # HA expects 1.0 = open, 0.0 = closed. Calibration (smer_open:true) defines
+    # the reference as 0.0, so "open" in HA drives the other way (smer_open:false).
+    open_action:
+      - script.execute:
+          id: jazdi_na_doraz
+          smer_open: false
+          meraj_cas: false
+    close_action:
+      - script.execute:
+          id: jazdi_na_doraz
+          smer_open: true
+          meraj_cas: false
+    stop_action:
+      - script.stop: jazdi_na_doraz
+      - script.stop: chod_na_poziciu
+      - script.execute: stop_vsetko
+    position_action:
+      - script.execute:
+          id: chod_na_poziciu
+          cielova_pozicia: !lambda "return pos;"
+
+# =============================================================================
+#  Manual calibration from HA — run once after install, then only when the
+#  stored position may have drifted from reality.
+# =============================================================================
+button:
+  - platform: template
+    name: "Kalibrovať (obe strany)"
+    entity_category: config
+    on_press:
+      - script.execute: kalibruj
