@@ -60,20 +60,18 @@ away from IO26, which is exactly why the button pins are parametrised.
 
 ## Board files
 
-The board was designed in EasyEDA. The design files are not published yet — the
-pinout and BOM above are enough to rebuild the wiring on a protoboard, but not
-to order a PCB.
+The board was designed in EasyEDA and is published on OSHWLab:
 
-<!-- To publish them, export from EasyEDA into hardware/ and link them here:
-     - schematic.pdf            (File → Export → PDF)
-     - pcb-top.pdf, pcb-bottom.pdf
-     - gerbers.zip              (Fabrication → PCB Fabrication File)
-     - bom.csv                  (Fabrication → BOM)
-     - pick-and-place.csv
-     - easyeda-project.json     (File → Export → EasyEDA source)
-     Also record the fab settings used (layers, thickness, copper weight,
-     surface finish) so the next order is reproducible, and state the hardware
-     licence separately from the firmware — CERN-OHL-S or CC BY-SA are usual. -->
+**https://oshwlab.com/rigopeter11/project_vgotgxfv**
+
+From there you can open the schematic and PCB in the EasyEDA editor, clone the
+project, or order the board directly through JLCPCB.
+
+<!-- Worth adding here when there is time: a schematic PDF and a photo of the
+     assembled board, so the repo is readable without an EasyEDA account. Also
+     the fab settings used (layers, thickness, copper weight, surface finish)
+     so the next order is reproducible, and a hardware licence stated separately
+     from the firmware's MIT -- CERN-OHL-S or CC BY-SA are the usual picks. -->
 
 ## Choosing the current threshold
 

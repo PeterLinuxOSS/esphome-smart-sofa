@@ -5,6 +5,8 @@ ESP32 board wired in **parallel** with the original hand controller, exposing
 the sofa to Home Assistant as a `cover` with a real 0–100 % position slider —
 **without adding any limit switches**.
 
+Firmware here, [board on OSHWLab](https://oshwlab.com/rigopeter11/project_vgotgxfv).
+
 Position is estimated from travel time, and the end stops are detected from the
 actuator's current draw measured by an INA226. The original buttons keep
 working, and pressing them updates the position estimate too.
@@ -35,8 +37,8 @@ project adds:
 | `docs/calibration.md` | How calibration and position estimation work |
 | `docs/home-assistant.md` | Entities exposed, and how to use them |
 
-The PCB design files are not published yet; `docs/hardware.md` carries the
-pinout and BOM in the meantime.
+The PCB is published on OSHWLab — schematic, board and a JLCPCB order button:
+**https://oshwlab.com/rigopeter11/project_vgotgxfv**
 
 ## Usage
 
