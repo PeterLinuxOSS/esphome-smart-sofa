@@ -13,12 +13,13 @@ substitutions:
   pin_btn_open:  "GPIO25"
   pin_btn_close: "GPIO26"
 
-  # Seed values only; the calibration button measures and stores the real ones.
+  # Seed values only; the board measures and stores its own, and keeps refining
+  # them on every full-travel run. See docs/calibration.md.
   extend_time_ms:  "9000"
   retract_time_ms:  "10000"
 
 packages:
-  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v2.1.0
+  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v3.0.0
 
 api:
   encryption:

@@ -52,7 +52,7 @@ substitutions:
   pin_btn_close: "GPIO26"
 
 packages:
-  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v2.1.0
+  sofa: github://PeterLinuxOSS/esphome-smart-sofa/packages/smart-sofa.yaml@v3.0.0
 
 api:
   encryption:

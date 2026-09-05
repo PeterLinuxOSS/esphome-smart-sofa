@@ -50,26 +50,96 @@ would refuse to move the cover "back" — it would think it is already there.
 The same fallback runs when a drive-to-endstop times out: the position is
 estimated from elapsed time rather than falsely pinned to `0.0` or `1.0`.
 
-## Calibration
+## How the travel times are learned
 
-The **Calibrate (both ends)** button in HA runs `calibrate`, three phases:
+The board measures itself. Every run that is *provably* a full travel updates
+the stored time; there is exactly one place in the firmware that writes
+`g_extend_ms` / `g_retract_ms`, at the end of `drive_to_endstop`.
 
-| Phase | Direction | Measures? | Why |
-|---|---|---|---|
-| 1/3 | `sw_open` → 0.0 | no | Start position unknown, so the time is meaningless |
-| 2/3 | `sw_close` → 1.0 | yes | Starts from a known end stop — guaranteed full travel |
-| 3/3 | `sw_open` → 0.0 | yes | Same, and leaves the sofa at the reference position |
+A run counts as a sample only when all of these hold:
 
-This is why `drive_to_endstop` takes a `measure` parameter. Ordinary
-open/close/button presses **must** pass `measure: false`: they can start from
-any mid position, and a partial run would overwrite the full-travel time with a
-too-short value, permanently skewing every later position command.
+- it set off from the **confirmed opposite end stop** (`g_start_endstop`),
+- it **arrived** at the target end stop, without hitting `Max runtime`,
+- nothing interrupted it.
 
-Measured times are only accepted when plausible (`> 1 s` and `< 30 s`).
+`g_at_endstop` carries that confirmation. Only a detected end stop sets it, and
+it is deliberately **not** restored across reboots — after a restart the board
+has not seen an end stop yet, so the first move teaches nothing.
+
+### What the sample actually measures
+
+The timestamp used is `g_below_thr_since`, the moment the current first dropped
+below the threshold — not the moment the debounce confirmed it. That removes
+`Endstop confirmation time` from the measurement **exactly**, rather than
+approximately.
+
+What remains is the group delay of the median filter on `current_a`: a window of
+5 at 100 ms crosses roughly two intervals after the real edge, so a constant
+`FILTER_LAG_MS = 200` is subtracted. **If you change either the window size or
+the update interval, change that constant with them.**
+
+Before this, the stored time included both delays — about 400 ms of detection
+lag baked into a 9 s travel. Every partial move then overshot by that fraction.
+
+### Averaging, and rejecting nonsense
+
+```
+stored += 0.3 * (sample - stored)      // only if sample is within ±15 % of stored
+```
+
+A sample further than 15 % from the stored value is logged and thrown away. This
+is what keeps a false end stop mid-travel — a current dip, a supply sag, a
+frozen INA226 reading — from being written in as a full travel. Real-world
+scatter between runs is 1–4 %, so the band is wide enough never to fire on an
+honest measurement.
+
+When `g_seeded` is `false` the stored value is still the seed from the device
+file. It was never measured, so there is nothing to range-check against and the
+first clean sample is taken at face value.
+
+### The 0 % and 100 % commands do not run on the clock
+
+`move_to_position` hands both extremes to `drive_to_endstop`. Planning them from
+the stored time would stop the moment the plan says so, so a travel *longer*
+than the stored one could never be observed and the learned value could only
+ever drift downwards. Driving to the real end stop also re-references
+`g_position`, which is where accumulated estimation drift gets cleaned up.
+
+### Watching it settle
+
+Two diagnostic sensors exist for exactly this: **Last travel sample** (the raw
+measurement that went in) and **Travel samples** (how many have been accepted).
+A stored time that barely moves while the count keeps climbing is a settled one.
+That is the difference between a number you can trust and a number that appeared
+out of nowhere.
+
+## The Calibrate button
+
+**Calibrate (both ends)** is not a separate way of measuring. It clears
+`g_seeded`, seeks the reference end stop, then forces **three round trips** —
+six clean full travels — and lets the ordinary learning above digest them. One
+code path, no second way to write the times.
+
+Use it after installing a board, or when the mechanics changed so much that
+normal runs are being rejected as out of range. Clearing `g_seeded` is what lets
+it escape that: the old value is precisely what would reject the new, correct
+samples.
+
+While it runs, `g_calibrating` makes the hand controller and Home Assistant's
+open/close/position commands do nothing. Releasing a physical button, or the
+cover's stop action, still aborts it — nobody sitting on the sofa at 02:00 is
+trapped by a calibration run.
 
 Calibration does **not** run on boot. `g_position` is restored from flash, so a
-normal reboot needs no movement. Run it by hand after installing the board, or
-after a power cut that interrupted a movement.
+normal reboot needs no movement.
+
+## Pushing into an end stop does nothing
+
+If the sofa is already at an end stop and you ask for that same end stop again,
+`drive_to_endstop` returns immediately without energising the actuator. It
+cannot move past its own internal limit switch anyway, and without the early
+return the relay was held on for grace + debounce — about a second of nothing,
+every press.
 
 ### Upgrading across a rename
 

@@ -75,9 +75,16 @@ It comes from elapsed time, not an encoder. It is accurate enough for scenes
 and sliders, but:
 
 - It drifts slightly on every interrupted movement.
-- After a power cut *during* a movement, the stored value is stale — recalibrate.
+- After a power cut *during* a movement, the stored value is stale — drive to
+  either end and it re-references itself.
 - Reaching either end stop resets the drift to zero, so anything that
-  occasionally drives fully open or fully closed is self-correcting.
+  occasionally drives fully open or fully closed is self-correcting. Commanding
+  0 % or 100 % counts: both go to the physical end stop, not to a timer.
+
+Two diagnostic sensors show whether the timing the estimate rests on has
+settled: **Last travel sample** is the raw measurement that went in most
+recently, **Travel samples** is how many have been accepted. A stored travel
+time that barely moves while the count keeps rising is one you can trust.
 
 ## Grouping several units
 

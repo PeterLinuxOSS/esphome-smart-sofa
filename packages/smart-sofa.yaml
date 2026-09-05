@@ -29,8 +29,9 @@ substitutions:
   shunt_ohm:     "0.02"
   max_current:   "4.0"
 
-  # Full-travel times. Only seed values — calibration overwrites them and they
-  # survive reboots (restore_value on the globals). Measure once, then forget.
+  # Full-travel times. Only seed values — the board measures its own and keeps
+  # them across reboots (restore_value on the globals). Every guaranteed
+  # endstop-to-endstop run refines them; see docs/calibration.md.
   extend_time_ms:  "9000"    # full extend  (open, position 0 -> 1)
   retract_time_ms: "10000"   # full retract (close, position 1 -> 0)
 
@@ -38,7 +39,7 @@ substitutions:
   # manufacturer and model, and renders the version as "x (ESPHome y)" — without
   # this a board just says "esp32 by Espressif".
   project_name:    "PeterLinuxOSS.Smart Sofa"
-  project_version: "2.1.0"
+  project_version: "3.0.0"
 
   # Entity names. Overridable so the dashboard can be in any language without
   # forking — see docs/home-assistant.md before changing them on a live system.
@@ -49,6 +50,8 @@ substitutions:
   name_position:       "Position"
   name_extend_time:    "Measured extend time"
   name_retract_time:   "Measured retract time"
+  name_last_sample:    "Last travel sample"
+  name_sample_count:   "Travel samples"
   name_wifi_signal:    "WiFi signal"
   name_uptime:         "Uptime"
   name_btn_up:         "Button up"
@@ -166,6 +169,26 @@ sensor:
     update_interval: 5s
     entity_category: diagnostic
 
+  # The two below are what makes the learned times trustworthy rather than a
+  # number that appeared out of nowhere: the raw measurement that went in last,
+  # and how many have been accepted. A stored time that barely moves while the
+  # sample count keeps climbing is a settled one.
+  - platform: template
+    name: "${name_last_sample}"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    lambda: "return id(g_last_sample_ms);"
+    update_interval: 5s
+    entity_category: diagnostic
+
+  - platform: template
+    name: "${name_sample_count}"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: "return id(g_sample_count);"
+    update_interval: 5s
+    entity_category: diagnostic
+
   - platform: wifi_signal
     name: "${name_wifi_signal}"
     update_interval: 60s
@@ -214,6 +237,47 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"        # 0 = not currently below the endstop threshold
+
+  # Where the sofa is known to physically be, as opposed to where the time
+  # estimate thinks it is. Only a detected endstop sets this. NOT restored: after
+  # a reboot we have not seen an endstop yet, so nothing may be learned until the
+  # first confirmed full run.
+  - id: g_at_endstop
+    type: int8_t
+    restore_value: false
+    initial_value: "0"        # -1 at position 0.0, +1 at position 1.0, 0 unknown
+
+  # g_at_endstop as it was when the current run set off. A travel time is only
+  # believable if the run started at the opposite endstop and ended on this one.
+  - id: g_start_endstop
+    type: int8_t
+    restore_value: false
+    initial_value: "0"
+
+  # false = g_extend_ms/g_retract_ms are still the seed from the device file, so
+  # the next clean sample is taken at face value instead of being range-checked
+  # against a number that was never measured.
+  - id: g_seeded
+    type: bool
+    restore_value: true
+    initial_value: "false"
+
+  - id: g_last_sample_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: g_sample_count
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+
+  # Set while calibrate runs, so the hand controller and HA cannot cut into a
+  # measuring run. The cover's stop action still aborts it.
+  - id: g_calibrating
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 # =============================================================================
 #  Tuning parameters — changeable from HA, no reflash needed
@@ -323,6 +387,9 @@ script:
             }
           }
           id(g_direction) = 0;
+          // Stopped somewhere in between: the position is an estimate again and
+          // no run that starts here may be treated as a full travel.
+          id(g_at_endstop) = 0;
       - switch.turn_off: sw_open
       - switch.turn_off: sw_close
 
@@ -331,113 +398,175 @@ script:
   #                         +1 = towards position 1.0 (via sw_close)
   # Must match move_to_position, otherwise the extrapolation on stop counts
   # backwards.
-  # measure: true ONLY when the whole travel is guaranteed (calibration phases
-  # that start from a known endstop). Regular open/close/button may start from
-  # any mid position and must pass false, or a partial run would overwrite the
-  # full-travel time.
+  # Travel time is learned here, and nowhere else. A run only produces a sample
+  # when it set off from the confirmed opposite endstop and arrived at this one —
+  # any partial run, interruption or post-reboot first move teaches nothing.
   - id: drive_to_endstop
     mode: restart
     parameters:
       towards_zero: bool
-      measure: bool
     then:
-      - switch.turn_off: sw_open
-      - switch.turn_off: sw_close
-      - delay: 300ms
-      - lambda: |-
-          id(g_direction) = towards_zero ? -1 : 1;
-          id(g_move_start) = millis();
-          id(g_below_thr_since) = 0;
+      # Already sitting on the requested endstop: do nothing. Without this the
+      # relay is energised for grace + debounce (~1 s) while the actuator, long
+      # since cut off by its own internal limit switch, cannot move at all.
+      # The whole drive lives in the else branch rather than behind an early
+      # script.stop, because stopping a mode:restart script from inside itself
+      # is not a guaranteed way to abandon the remaining actions.
       - if:
           condition:
-            lambda: "return towards_zero;"
+            lambda: "return id(g_at_endstop) == (towards_zero ? -1 : 1);"
           then:
-            - switch.turn_on: sw_open
+            - logger.log: "Already at this endstop — not energising the actuator"
+            - lambda: |-
+                id(g_position) = towards_zero ? 0.0f : 1.0f;
+                id(g_direction) = 0;
           else:
-            - switch.turn_on: sw_close
-      - lambda: "id(g_move_start) = millis();"
-      - delay: !lambda "return (uint32_t) id(startup_grace_ms).state;"
-      - wait_until:
-          condition:
-            lambda: |-
-              if (id(current_a).state < id(endstop_threshold).state) {
-                if (id(g_below_thr_since) == 0) id(g_below_thr_since) = millis();
-                return (millis() - id(g_below_thr_since)) >= (uint32_t) id(endstop_debounce_ms).state;
-              } else {
+            - switch.turn_off: sw_open
+            - switch.turn_off: sw_close
+            - delay: 300ms
+            - lambda: |-
+                id(g_direction) = towards_zero ? -1 : 1;
+                id(g_move_start) = millis();
                 id(g_below_thr_since) = 0;
-                return false;
-              }
-          timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000);"
-      - switch.turn_off: sw_open
-      - switch.turn_off: sw_close
-      - lambda: |-
-          // Decide why we stopped from TIME, not from current — current drops
-          // to zero the instant the outputs go off, so reading it here races.
-          uint32_t elapsed = millis() - id(g_move_start);
-          bool reached = elapsed < (uint32_t)(id(max_runtime_s).state * 1000);
-          if (reached) {
-            id(g_position) = towards_zero ? 0.0f : 1.0f;
-            if (measure && elapsed > 1000 && elapsed < 30000) {
-              if (towards_zero) { id(g_extend_ms) = elapsed; }
-              else { id(g_retract_ms) = elapsed; }
-            }
-          } else {
-            // Timeout — endstop not reached, estimate from time instead of
-            // falsely pinning the position to 0/1.
-            uint32_t full_ms = towards_zero ? id(g_extend_ms) : id(g_retract_ms);
-            if (full_ms > 0) {
-              float delta = ((float) elapsed / (float) full_ms) * id(g_direction);
-              id(g_position) += delta;
-              if (id(g_position) < 0.0f) id(g_position) = 0.0f;
-              if (id(g_position) > 1.0f) id(g_position) = 1.0f;
-            }
-          }
-          id(g_direction) = 0;
-      - logger.log:
-          format: "Endstop reached. extend=%u ms  retract=%u ms"
-          args: ["id(g_extend_ms)", "id(g_retract_ms)"]
+                // Remember the starting point, then drop the confirmation — from
+                // here until we hit something the physical position is unknown.
+                id(g_start_endstop) = id(g_at_endstop);
+                id(g_at_endstop) = 0;
+            - if:
+                condition:
+                  lambda: "return towards_zero;"
+                then:
+                  - switch.turn_on: sw_open
+                else:
+                  - switch.turn_on: sw_close
+            - lambda: "id(g_move_start) = millis();"
+            - delay: !lambda "return (uint32_t) id(startup_grace_ms).state;"
+            - wait_until:
+                condition:
+                  lambda: |-
+                    if (id(current_a).state < id(endstop_threshold).state) {
+                      if (id(g_below_thr_since) == 0) id(g_below_thr_since) = millis();
+                      return (millis() - id(g_below_thr_since)) >= (uint32_t) id(endstop_debounce_ms).state;
+                    } else {
+                      id(g_below_thr_since) = 0;
+                      return false;
+                    }
+                timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000);"
+            - switch.turn_off: sw_open
+            - switch.turn_off: sw_close
+            - lambda: |-
+                // Decide why we stopped from TIME, not from current — current
+                // drops to zero the instant the outputs go off, so reading it
+                // here races.
+                uint32_t elapsed = millis() - id(g_move_start);
+                bool reached = elapsed < (uint32_t)(id(max_runtime_s).state * 1000);
+                if (!reached) {
+                  // Timeout — endstop not reached, estimate from time instead of
+                  // falsely pinning the position to 0/1.
+                  uint32_t full_ms = towards_zero ? id(g_extend_ms) : id(g_retract_ms);
+                  if (full_ms > 0) {
+                    float delta = ((float) elapsed / (float) full_ms) * id(g_direction);
+                    id(g_position) += delta;
+                    if (id(g_position) < 0.0f) id(g_position) = 0.0f;
+                    if (id(g_position) > 1.0f) id(g_position) = 1.0f;
+                  }
+                  id(g_direction) = 0;
+                  ESP_LOGW("sofa", "Timed out before the endstop after %u ms", elapsed);
+                  return;
+                }
 
-  # Calibration — hits both endstops, measures both times, ends at reference 0.0.
-  # Phase 1 does NOT measure (unknown start); phases 2 and 3 do, because they
-  # follow directly on a reached endstop and are guaranteed full travels.
+                id(g_position) = towards_zero ? 0.0f : 1.0f;
+                id(g_at_endstop) = towards_zero ? -1 : 1;
+                id(g_direction) = 0;
+
+                // Learn only from a guaranteed full travel: set off from the
+                // opposite endstop, arrived at this one, never interrupted.
+                if (id(g_start_endstop) != (towards_zero ? 1 : -1)) return;
+                if (id(g_below_thr_since) <= id(g_move_start)) return;
+
+                // Measure to the moment the current actually dropped, not to the
+                // moment the debounce confirmed it — that removes
+                // endstop_debounce_ms exactly. What is left is the group delay of
+                // the median filter on current_a: a window of 5 at 100 ms crosses
+                // roughly two intervals after the real edge. Keep FILTER_LAG_MS
+                // in step with that filter if either is ever changed.
+                const uint32_t FILTER_LAG_MS = 200;
+                uint32_t sample = id(g_below_thr_since) - id(g_move_start);
+                sample = (sample > FILTER_LAG_MS) ? sample - FILTER_LAG_MS : 0;
+
+                uint32_t cur = towards_zero ? id(g_extend_ms) : id(g_retract_ms);
+                uint32_t next;
+                if (!id(g_seeded)) {
+                  // Stored value is the seed from the device file — never
+                  // measured, so there is nothing to sanity check it against.
+                  next = sample;
+                } else if (sample * 20 >= cur * 17 && sample * 20 <= cur * 23) {
+                  // Exponential moving average, alpha 0.3. Converges in a handful
+                  // of runs and a single odd sample cannot move it far.
+                  next = (uint32_t) (cur + 0.3f * ((float) sample - (float) cur));
+                } else {
+                  ESP_LOGW("sofa", "Rejected %s sample of %u ms — outside 15%% of the stored %u ms",
+                           towards_zero ? "extend" : "retract", sample, cur);
+                  return;
+                }
+
+                if (towards_zero) { id(g_extend_ms) = next; } else { id(g_retract_ms) = next; }
+                id(g_seeded) = true;
+                id(g_last_sample_ms) = sample;
+                id(g_sample_count) = id(g_sample_count) + 1;
+                ESP_LOGI("sofa", "Learned %s: sample %u ms -> stored %u ms (%u samples)",
+                         towards_zero ? "extend" : "retract", sample, next, id(g_sample_count));
+
+  # Calibration is not a separate way of measuring — it just forces six clean
+  # full travels in a row and lets the ordinary learning above digest them. Use
+  # it after install, or when the mechanics changed so much that normal runs are
+  # being rejected as out of range. Ends at reference 0.0.
   - id: calibrate
     mode: single
     then:
-      - logger.log: "Calibration: phase 1/3 — to endstop via sw_open (position 0.0, not measuring)"
+      - lambda: |-
+          id(g_calibrating) = true;
+          // Drop the stored times: after a mechanical change the old value is
+          // exactly what would reject the new, correct samples. The first sample
+          // is then taken at face value and the next five average into it.
+          id(g_seeded) = false;
+          id(g_at_endstop) = 0;
+      - logger.log: "Calibration: seeking the reference endstop, this run is not a sample"
       - script.execute:
           id: drive_to_endstop
           towards_zero: true
-          measure: false
       - wait_until:
           condition:
             lambda: "return !id(drive_to_endstop).is_running();"
           timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000) + 5000;"
       - delay: 500ms
 
-      - logger.log: "Calibration: phase 2/3 — to endstop via sw_close (position 1.0, measuring)"
-      - script.execute:
-          id: drive_to_endstop
-          towards_zero: false
-          measure: true
-      - wait_until:
-          condition:
-            lambda: "return !id(drive_to_endstop).is_running();"
-          timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000) + 5000;"
-      - delay: 500ms
+      - repeat:
+          count: 3
+          then:
+            - logger.log: "Calibration: out to the far endstop"
+            - script.execute:
+                id: drive_to_endstop
+                towards_zero: false
+            - wait_until:
+                condition:
+                  lambda: "return !id(drive_to_endstop).is_running();"
+                timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000) + 5000;"
+            - delay: 500ms
+            - logger.log: "Calibration: back to the reference endstop"
+            - script.execute:
+                id: drive_to_endstop
+                towards_zero: true
+            - wait_until:
+                condition:
+                  lambda: "return !id(drive_to_endstop).is_running();"
+                timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000) + 5000;"
+            - delay: 500ms
 
-      - logger.log: "Calibration: phase 3/3 — back to reference (position 0.0, measuring)"
-      - script.execute:
-          id: drive_to_endstop
-          towards_zero: true
-          measure: true
-      - wait_until:
-          condition:
-            lambda: "return !id(drive_to_endstop).is_running();"
-          timeout: !lambda "return (uint32_t)(id(max_runtime_s).state * 1000) + 5000;"
-
+      - lambda: "id(g_calibrating) = false;"
       - logger.log:
-          format: "Calibration done. extend=%u ms  retract=%u ms"
-          args: ["id(g_extend_ms)", "id(g_retract_ms)"]
+          format: "Calibration done. extend=%u ms  retract=%u ms  (%u samples)"
+          args: ["id(g_extend_ms)", "id(g_retract_ms)", "id(g_sample_count)"]
 
   # Move to an exact position 0.0–1.0, timed from the measured travel times.
   # Same convention as drive_to_endstop: decreasing position (delta<0) = sw_open,
@@ -447,63 +576,87 @@ script:
     parameters:
       target: float
     then:
-      - lambda: |-
-          float delta = target - id(g_position);
-          if (fabs(delta) < 0.01f) {
-            id(g_planned_ms) = 0;
-            return;
-          }
-          bool towards_zero = (delta < 0);
-          uint32_t full_ms = towards_zero ? id(g_extend_ms) : id(g_retract_ms);
-          id(g_planned_ms) = (uint32_t)(fabs(delta) * full_ms);
-          id(g_direction) = towards_zero ? -1 : 1;
-          id(g_move_start) = millis();   // set now, so a stop during the 300 ms
-                                         // pause below does not use a stale value
+      # 0 % and 100 % run to the physical endstop instead of on the clock.
+      # Planning an extreme from the stored time can only ever stop early — the
+      # moment the plan says so — so a full travel would never be observed and
+      # the learned value could drift down but never back up. Going to the real
+      # endstop also re-references the position, which is where accumulated
+      # estimation drift gets cleaned up.
       - if:
           condition:
-            lambda: "return id(g_planned_ms) > 0;"
+            lambda: "return target <= 0.005f || target >= 0.995f;"
           then:
-            - switch.turn_off: sw_open
-            - switch.turn_off: sw_close
-            - delay: 300ms
+            - script.execute:
+                id: drive_to_endstop
+                towards_zero: !lambda "return target <= 0.005f;"
+          else:
+            - lambda: |-
+                float delta = target - id(g_position);
+                if (fabs(delta) < 0.01f) {
+                  id(g_planned_ms) = 0;
+                  return;
+                }
+                bool towards_zero = (delta < 0);
+                uint32_t full_ms = towards_zero ? id(g_extend_ms) : id(g_retract_ms);
+                id(g_planned_ms) = (uint32_t)(fabs(delta) * full_ms);
+                id(g_direction) = towards_zero ? -1 : 1;
+                id(g_move_start) = millis();   // set now, so a stop during the
+                                               // 300 ms pause below does not use
+                                               // a stale value
             - if:
                 condition:
-                  lambda: "return id(g_direction) < 0;"
+                  lambda: "return id(g_planned_ms) > 0;"
                 then:
-                  - switch.turn_on: sw_open
-                else:
-                  - switch.turn_on: sw_close
-            - lambda: "id(g_move_start) = millis(); id(g_below_thr_since) = 0;"
-            - wait_until:
-                condition:
-                  lambda: |-
-                    uint32_t elapsed = millis() - id(g_move_start);
-                    bool time_up = elapsed >= id(g_planned_ms);
-                    bool past_grace = elapsed > (uint32_t) id(startup_grace_ms).state;
-                    bool below_thr = id(current_a).state < id(endstop_threshold).state;
-                    bool at_endstop = false;
-                    if (past_grace && below_thr) {
-                      if (id(g_below_thr_since) == 0) id(g_below_thr_since) = millis();
-                      at_endstop = (millis() - id(g_below_thr_since)) >= (uint32_t) id(endstop_debounce_ms).state;
-                    } else {
+                  - switch.turn_off: sw_open
+                  - switch.turn_off: sw_close
+                  - delay: 300ms
+                  - if:
+                      condition:
+                        lambda: "return id(g_direction) < 0;"
+                      then:
+                        - switch.turn_on: sw_open
+                      else:
+                        - switch.turn_on: sw_close
+                  - lambda: |-
+                      id(g_move_start) = millis();
                       id(g_below_thr_since) = 0;
-                    }
-                    return time_up || at_endstop;
-                timeout: !lambda "return id(g_planned_ms) + 3000;"
-            - switch.turn_off: sw_open
-            - switch.turn_off: sw_close
-            - lambda: |-
-                // Again decided from TIME: did we finish before the planned
-                // duration? Then it was an endstop. Reading current here races.
-                uint32_t elapsed = millis() - id(g_move_start);
-                bool at_endstop = elapsed < id(g_planned_ms);
-                if (at_endstop) {
-                  id(g_position) = (id(g_direction) < 0) ? 0.0f : 1.0f;
-                } else {
-                  id(g_position) = target;
-                }
-                id(g_direction) = 0;
-      - logger.log: "Move to position finished"
+                      // Leaving a known endstop: the position is an estimate
+                      // again, so nothing measured from here may be learned.
+                      id(g_at_endstop) = 0;
+                  - wait_until:
+                      condition:
+                        lambda: |-
+                          uint32_t elapsed = millis() - id(g_move_start);
+                          bool time_up = elapsed >= id(g_planned_ms);
+                          bool past_grace = elapsed > (uint32_t) id(startup_grace_ms).state;
+                          bool below_thr = id(current_a).state < id(endstop_threshold).state;
+                          bool at_endstop = false;
+                          if (past_grace && below_thr) {
+                            if (id(g_below_thr_since) == 0) id(g_below_thr_since) = millis();
+                            at_endstop = (millis() - id(g_below_thr_since)) >= (uint32_t) id(endstop_debounce_ms).state;
+                          } else {
+                            id(g_below_thr_since) = 0;
+                          }
+                          return time_up || at_endstop;
+                      timeout: !lambda "return id(g_planned_ms) + 3000;"
+                  - switch.turn_off: sw_open
+                  - switch.turn_off: sw_close
+                  - lambda: |-
+                      // Again decided from TIME: did we finish before the planned
+                      // duration? Then it was an endstop. Reading current here races.
+                      uint32_t elapsed = millis() - id(g_move_start);
+                      bool at_endstop = elapsed < id(g_planned_ms);
+                      if (at_endstop) {
+                        // Ran into the endstop earlier than planned, so the
+                        // position estimate was off. Re-reference it, but do not
+                        // learn a time — this was not a full travel.
+                        id(g_position) = (id(g_direction) < 0) ? 0.0f : 1.0f;
+                        id(g_at_endstop) = (id(g_direction) < 0) ? -1 : 1;
+                      } else {
+                        id(g_position) = target;
+                      }
+                      id(g_direction) = 0;
+            - logger.log: "Move to position finished"
 
 # =============================================================================
 #  Original hand controller via PC817C — hold = drive to endstop, release = stop.
@@ -525,19 +678,25 @@ binary_sensor:
     on_press:
       - if:
           condition:
-            switch.is_off: button_lock
+            and:
+              - switch.is_off: button_lock
+              - lambda: "return !id(g_calibrating);"
           then:
             - script.execute:
                 id: drive_to_endstop
                 towards_zero: true
-                measure: false
     on_release:
+      # A press does nothing while calibrating, but a release still stops
+      # everything — otherwise someone sitting on the sofa at 02:00 would have no
+      # physical way out of a calibration run.
       - if:
           condition:
             switch.is_off: button_lock
           then:
+            - script.stop: calibrate
             - script.stop: drive_to_endstop
             - script.stop: move_to_position
+            - lambda: "id(g_calibrating) = false;"
             - script.execute: stop_all
 
   - platform: gpio
@@ -554,19 +713,25 @@ binary_sensor:
     on_press:
       - if:
           condition:
-            switch.is_off: button_lock
+            and:
+              - switch.is_off: button_lock
+              - lambda: "return !id(g_calibrating);"
           then:
             - script.execute:
                 id: drive_to_endstop
                 towards_zero: false
-                measure: false
     on_release:
+      # A press does nothing while calibrating, but a release still stops
+      # everything — otherwise someone sitting on the sofa at 02:00 would have no
+      # physical way out of a calibration run.
       - if:
           condition:
             switch.is_off: button_lock
           then:
+            - script.stop: calibrate
             - script.stop: drive_to_endstop
             - script.stop: move_to_position
+            - lambda: "id(g_calibrating) = false;"
             - script.execute: stop_all
 
   - platform: template
@@ -587,23 +752,35 @@ cover:
     # HA expects 1.0 = open, 0.0 = closed. Calibration (towards_zero:true)
     # defines the reference as 0.0, so "open" in HA drives the other way.
     open_action:
-      - script.execute:
-          id: drive_to_endstop
-          towards_zero: false
-          measure: false
+      - if:
+          condition:
+            lambda: "return !id(g_calibrating);"
+          then:
+            - script.execute:
+                id: drive_to_endstop
+                towards_zero: false
     close_action:
-      - script.execute:
-          id: drive_to_endstop
-          towards_zero: true
-          measure: false
+      - if:
+          condition:
+            lambda: "return !id(g_calibrating);"
+          then:
+            - script.execute:
+                id: drive_to_endstop
+                towards_zero: true
     stop_action:
+      - script.stop: calibrate
       - script.stop: drive_to_endstop
       - script.stop: move_to_position
+      - lambda: "id(g_calibrating) = false;"
       - script.execute: stop_all
     position_action:
-      - script.execute:
-          id: move_to_position
-          target: !lambda "return pos;"
+      - if:
+          condition:
+            lambda: "return !id(g_calibrating);"
+          then:
+            - script.execute:
+                id: move_to_position
+                target: !lambda "return pos;"
 
 # =============================================================================
 #  Manual calibration from HA — run once after install, then only when the
