@@ -93,9 +93,15 @@ frozen INA226 reading — from being written in as a full travel. Real-world
 scatter between runs is 1–4 %, so the band is wide enough never to fire on an
 honest measurement.
 
-When `g_seeded` is `false` the stored value is still the seed from the device
-file. It was never measured, so there is nothing to range-check against and the
-first clean sample is taken at face value.
+When a direction's seeded flag is `false` the stored value is still the seed from
+the device file, or calibration dropped it. Either way it was never measured, so
+there is nothing to range-check against and the first clean sample in that
+direction is taken at face value.
+
+The flag is **per direction** (`g_seeded_extend`, `g_seeded_retract`). It used to
+be one shared flag, and that quietly broke calibration: the flag was cleared
+once, so only whichever direction was measured first got a clean value while the
+other kept averaging into the very number calibration was there to discard.
 
 ### The 0 % and 100 % commands do not run on the clock
 
@@ -115,15 +121,20 @@ out of nowhere.
 
 ## The Calibrate button
 
-**Calibrate (both ends)** is not a separate way of measuring. It clears
-`g_seeded`, seeks the reference end stop, then forces **three round trips** —
-six clean full travels — and lets the ordinary learning above digest them. One
-code path, no second way to write the times.
+**Calibrate (both ends)** is not a separate way of measuring. It clears both
+seeded flags and the sample counter, seeks the reference end stop, then forces
+**three round trips** — six clean full travels — and lets the ordinary learning
+above digest them. One code path, no second way to write the times.
 
 Use it after installing a board, or when the mechanics changed so much that
-normal runs are being rejected as out of range. Clearing `g_seeded` is what lets
+normal runs are being rejected as out of range. Clearing the flags is what lets
 it escape that: the old value is precisely what would reject the new, correct
 samples.
+
+The counter is reset as well, so **Travel samples** answers "how many samples
+back do the current times go" rather than counting up forever across
+calibrations. Three samples per direction: the first at face value, the next two
+averaged in at alpha 0.3.
 
 While it runs, `g_calibrating` makes the hand controller and Home Assistant's
 open/close/position commands do nothing. Releasing a physical button, or the

@@ -254,10 +254,19 @@ globals:
     restore_value: false
     initial_value: "0"
 
-  # false = g_extend_ms/g_retract_ms are still the seed from the device file, so
-  # the next clean sample is taken at face value instead of being range-checked
-  # against a number that was never measured.
-  - id: g_seeded
+  # false = this direction's stored time is still the seed from the device file
+  # (or was dropped by calibration), so the next clean sample is taken at face
+  # value instead of being range-checked against a number that was never
+  # measured. One flag PER DIRECTION: with a single shared flag, calibration
+  # reset it once and only whichever direction happened to be measured first
+  # got a clean value — the other kept averaging into the number calibration
+  # was supposed to throw away.
+  - id: g_seeded_extend
+    type: bool
+    restore_value: true
+    initial_value: "false"
+
+  - id: g_seeded_retract
     type: bool
     restore_value: true
     initial_value: "false"
@@ -502,10 +511,12 @@ script:
                 sample = (sample > FILTER_LAG_MS) ? sample - FILTER_LAG_MS : 0;
 
                 uint32_t cur = towards_zero ? id(g_extend_ms) : id(g_retract_ms);
+                bool seeded = towards_zero ? id(g_seeded_extend) : id(g_seeded_retract);
                 uint32_t next;
-                if (!id(g_seeded)) {
-                  // Stored value is the seed from the device file — never
-                  // measured, so there is nothing to sanity check it against.
+                if (!seeded) {
+                  // Stored value is the seed from the device file, or calibration
+                  // dropped it — either way there is nothing to sanity check it
+                  // against, so take the measurement as it is.
                   next = sample;
                 } else if (sample * 20 >= cur * 17 && sample * 20 <= cur * 23) {
                   // Exponential moving average, alpha 0.3. Converges in a handful
@@ -517,8 +528,13 @@ script:
                   return;
                 }
 
-                if (towards_zero) { id(g_extend_ms) = next; } else { id(g_retract_ms) = next; }
-                id(g_seeded) = true;
+                if (towards_zero) {
+                  id(g_extend_ms) = next;
+                  id(g_seeded_extend) = true;
+                } else {
+                  id(g_retract_ms) = next;
+                  id(g_seeded_retract) = true;
+                }
                 id(g_last_sample_ms) = sample;
                 id(g_sample_count) = id(g_sample_count) + 1;
                 ESP_LOGI("sofa", "Learned %s: sample %u ms -> stored %u ms (%u samples)",
@@ -533,10 +549,16 @@ script:
     then:
       - lambda: |-
           id(g_calibrating) = true;
-          // Drop the stored times: after a mechanical change the old value is
-          // exactly what would reject the new, correct samples. The first sample
-          // is then taken at face value and the next five average into it.
-          id(g_seeded) = false;
+          // Drop what was learned so far, in BOTH directions: after a mechanical
+          // change the old value is exactly what would reject the new, correct
+          // samples. The first sample per direction is then taken at face value
+          // and the next two average into it. The counter is reset too, so it
+          // says how many samples back the current times go — a count that keeps
+          // rising across calibrations tells nothing.
+          id(g_seeded_extend) = false;
+          id(g_seeded_retract) = false;
+          id(g_sample_count) = 0;
+          id(g_last_sample_ms) = 0;
           id(g_at_endstop) = 0;
       - logger.log: "Calibration: seeking the reference endstop, this run is not a sample"
       - script.execute:
