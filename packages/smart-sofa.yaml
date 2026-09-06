@@ -279,6 +279,13 @@ globals:
     restore_value: false
     initial_value: "false"
 
+  # Last g_direction pushed to the cover entity, so the operation is published
+  # on the edge only and not on every tick.
+  - id: g_published_direction
+    type: int
+    restore_value: false
+    initial_value: "0"
+
 # =============================================================================
 #  Tuning parameters — changeable from HA, no reflash needed
 # =============================================================================
@@ -781,6 +788,22 @@ cover:
             - script.execute:
                 id: move_to_position
                 target: !lambda "return pos;"
+
+# The template cover platform reports position only, so without this the entity
+# is stuck on open/closed and Home Assistant never shows opening/closing.
+# Published on the g_direction edge; save=false keeps it out of NVS.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (id(g_direction) != id(g_published_direction)) {
+            id(g_published_direction) = id(g_direction);
+            id(sofa).current_operation =
+                id(g_direction) > 0 ? esphome::cover::COVER_OPERATION_OPENING
+              : id(g_direction) < 0 ? esphome::cover::COVER_OPERATION_CLOSING
+                                    : esphome::cover::COVER_OPERATION_IDLE;
+            id(sofa).publish_state(false);
+          }
 
 # =============================================================================
 #  Manual calibration from HA — run once after install, then only when the
